@@ -1,5 +1,6 @@
 import glob
 import io
+import urllib.request
 
 import pandas as pd
 import plotly.express as px
@@ -24,6 +25,7 @@ st.set_page_config(page_title="콘크리트 강도 안전 실습실", page_icon=
 st.title("🏗️ 콘크리트 강도가 약해서 생기는 안전문제")
 st.caption("국토안전관리원 콘크리트 압축강도 시험 자료로, 어떤 조건에서 강도가 기준에 못 미치는지 민감도 분석으로 살펴보는 앱")
 
+DATA_URL = "https://raw.githubusercontent.com/lovepjw090627-debug/data/refs/heads/main/concrete_clean.csv"
 NONE = "(사용 안 함)"
 ID_WORDS = ["번호", "연번", "순번", "코드", "ID"]
 FEAT_WORDS = ["반발경도", "재령", "타격각도", "측정", "보정", "계수", "설계기준강도"]
@@ -41,6 +43,12 @@ def read_bytes(b):
         except Exception:
             continue
     return None
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def read_url(url):
+    with urllib.request.urlopen(url, timeout=30) as r:
+        return read_bytes(r.read())
 
 
 def find(cols, words):
@@ -62,30 +70,29 @@ def make_model(name):
 # ------------------------------------------------------------------
 with st.sidebar:
     st.header("① 데이터")
-    up = st.file_uploader("CSV 파일 올리기", type="csv")
+    url = st.text_input("CSV 주소(URL)", value=DATA_URL)
+    up = st.file_uploader("또는 CSV 파일 올리기", type="csv")
     local = sorted(glob.glob("*.csv"))
     pick = None
-    if up is None and local:
-        idx = next((i for i, f in enumerate(local) if "콘크리트" in f), 0)
-        pick = st.selectbox("저장소(같은 폴더) 안의 CSV", local, index=idx)
+    if up is None and not url.strip() and local:
+        pick = st.selectbox("저장소(같은 폴더) 안의 CSV", local)
 
-if up is not None:
-    raw_bytes = up.getvalue()
-elif pick is not None:
-    with open(pick, "rb") as f:
-        raw_bytes = f.read()
-else:
-    st.info(
-        "CSV 파일이 필요해요. 두 가지 중 하나로 불러오세요.\n\n"
-        "1. 왼쪽 사이드바에서 CSV 파일 올리기\n"
-        "2. CSV 파일을 main.py와 같은 폴더(깃허브 저장소)에 넣기\n\n"
-        "(내 컴퓨터의 C:\\ 경로는 웹 앱이 직접 읽을 수 없어요.)"
-    )
+raw = None
+try:
+    if up is not None:
+        raw = read_bytes(up.getvalue())
+    elif url.strip():
+        raw = read_url(url.strip())
+    elif pick is not None:
+        with open(pick, "rb") as f:
+            raw = read_bytes(f.read())
+except Exception as e:
+    st.error(f"CSV를 불러오지 못했어요: {e}")
+    st.info("사이드바에서 CSV 파일을 직접 올리거나, 주소(URL)를 확인해 주세요.")
     st.stop()
 
-raw = read_bytes(raw_bytes)
 if raw is None or raw.shape[1] < 3:
-    st.error("CSV를 읽지 못했어요. 파일이 올바른 CSV인지 확인해 주세요.")
+    st.info("CSV 주소를 넣거나 CSV 파일을 올려 주세요.")
     st.stop()
 
 raw.columns = [str(c).strip() for c in raw.columns]
@@ -107,7 +114,7 @@ if len(num_cols) < 3:
 # ------------------------------------------------------------------
 with st.sidebar:
     st.header("② 열 고르기")
-    t_def = find(num_cols, ["코어강도", "추정강도", "압축강도", "코어"]) or num_cols[-1]
+    t_def = find(num_cols, ["코어강도", "재령보정강도평균", "추정강도", "압축강도"]) or num_cols[-1]
     target = st.selectbox("강도 열(예측할 값)", num_cols, index=num_cols.index(t_def))
 
     d_opts = [NONE] + [c for c in num_cols if c != target]
@@ -124,7 +131,7 @@ with st.sidebar:
         limit = st.number_input("안전 기준 강도(MPa)", 1.0, 200.0, 24.0, 1.0)
 
     cand = [c for c in num_cols if c != target and not any(w in c for w in ID_WORDS)]
-    f_def = [c for c in cand if any(w in c for w in FEAT_WORDS)] or cand[:8]
+    f_def = [c for c in cand if any(w in c for w in FEAT_WORDS) and "추정" not in c] or cand[:8]
     if use_design:
         f_def = [c for c in f_def if c != design]
     feats = st.multiselect("분석에 쓸 속성(숫자 열)", cand, default=f_def)
@@ -135,6 +142,11 @@ with st.sidebar:
     g_opts = [NONE] + cat_cols
     g_def = find(cat_cols, ["시설", "구분", "종류"])
     group = st.selectbox("시설물 구분 열(선택)", g_opts, index=g_opts.index(g_def) if g_def else 0)
+
+    drop_out = st.checkbox(
+        "극단적인 강도 값 제외", value=True,
+        help="강도가 사분위 범위의 5배 넘게 벗어난 줄을 뺍니다. 입력 오류로 보이는 값(예: 900)이 분석을 흔드는 걸 막아 줘요.",
+    )
 
     st.header("③ 모델 설정")
     model_name = st.radio("예측 모델", ["선형회귀", "랜덤포레스트"], horizontal=True)
@@ -154,6 +166,13 @@ if use_design:
     d = d[d[design] > 0]
 if group != NONE:
     d[group] = d[group].fillna("미상").astype(str)
+n_before = len(d)
+if drop_out:
+    q1, q3 = d[target].quantile([0.25, 0.75])
+    iqr = q3 - q1
+    if iqr > 0:
+        d = d[(d[target] >= q1 - 5 * iqr) & (d[target] <= q3 + 5 * iqr)]
+removed = n_before - len(d)
 d = d.reset_index(drop=True)
 
 if len(d) < 30:
@@ -184,8 +203,11 @@ with tab1:
     c3.metric(f"평균 {target}", f"{d[target].mean():.1f}")
     c4.metric("기준 미달(위험) 비율", f"{d['위험'].mean() * 100:.1f}%")
 
+    if drop_out:
+        st.caption(f"극단적인 강도 값으로 제외한 줄: {removed}개")
+
     st.subheader("분석에 쓴 데이터")
-    st.dataframe(d[need + extra + ["기준강도", "구분"]].head(20), use_container_width=True)
+    st.dataframe(d[need + extra + ["기준강도", "구분"]].head(20))
 
     with st.expander("원본 열 목록과 빈 값 비율"):
         info = pd.DataFrame(
@@ -195,7 +217,7 @@ with tab1:
                 "비어 있는 비율(%)": [round(raw[c].isna().mean() * 100, 1) for c in raw.columns],
             }
         )
-        st.dataframe(info, use_container_width=True, hide_index=True)
+        st.dataframe(info, hide_index=True)
     st.caption("이 자료는 이미 지어진 시설물(교량, 댐, 터널 등)을 시험한 결과라서, 물·시멘트 같은 배합 정보는 들어 있지 않아요.")
 
 # ------------------------------------------------------------------
@@ -212,19 +234,19 @@ with tab2:
     else:
         fig = px.histogram(t2, x=target, nbins=40, color="구분", color_discrete_map=color_map)
         fig.add_vline(x=float(limit), line_dash="dash", line_color="black", annotation_text=f"기준 {limit}")
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig)
 
     left, right = st.columns(2)
     with left:
         xf = st.selectbox("가로축 속성", feats)
         fig = px.scatter(d, x=xf, y=target, color="구분", opacity=0.6, color_discrete_map=color_map)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig)
     with right:
         st.markdown("**강도와의 상관계수**")
         corr = d[feats].corrwith(d[target]).dropna().sort_values().reset_index()
         corr.columns = ["속성", "상관계수"]
         fig = px.bar(corr, x="상관계수", y="속성", orientation="h")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig)
         st.caption("상관이 크다고 원인은 아니에요. 양수면 함께 커지는 경향이에요.")
 
     if group != NONE:
@@ -232,7 +254,7 @@ with tab2:
         g = d.groupby(group)["위험"].agg(["mean", "count"]).reset_index()
         g["위험 비율(%)"] = g["mean"] * 100
         fig = px.bar(g, x=group, y="위험 비율(%)", hover_data=["count"])
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig)
 
 # ------------------------------------------------------------------
 # 탭3: 예측 모델
@@ -247,7 +269,7 @@ with tab3:
     lo, hi = float(min(s_te.min(), pred_te.min())), float(max(s_te.max(), pred_te.max()))
     fig = px.scatter(x=s_te, y=pred_te, labels={"x": "실제 강도", "y": "예측 강도"}, opacity=0.7)
     fig.add_trace(go.Scatter(x=[lo, hi], y=[lo, hi], mode="lines", name="완벽한 예측", line=dict(dash="dot", color="gray")))
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig)
 
     st.subheader("'위험인가 안전인가' 맞히기 성적")
     lim_te = d.loc[X_te.index, "기준강도"]
@@ -259,7 +281,7 @@ with tab3:
     a3.metric("정밀도", f"{precision_score(r_true, r_pred, zero_division=0):.3f}")
     tn, fp, fn, tp = confusion_matrix(r_true, r_pred, labels=[0, 1]).ravel()
     cm = pd.DataFrame([[tn, fp], [fn, tp]], index=["실제 안전", "실제 위험"], columns=["예측 안전", "예측 위험"])
-    st.dataframe(cm, use_container_width=True)
+    st.dataframe(cm)
     st.caption(f"놓친 위험(실제 위험인데 안전이라 예측): {fn}건. 안전 문제에서는 이 숫자가 작을수록 좋아요.")
 
     if model_name == "선형회귀":
@@ -267,7 +289,7 @@ with tab3:
     else:
         vals, title = model.feature_importances_, "변수 중요도"
     imp = pd.DataFrame({"속성": feats, title: vals}).sort_values(title)
-    st.plotly_chart(px.bar(imp, x=title, y="속성", orientation="h"), use_container_width=True)
+    st.plotly_chart(px.bar(imp, x=title, y="속성", orientation="h"))
 
 # ------------------------------------------------------------------
 # 탭4: 민감도 분석
@@ -290,7 +312,7 @@ with tab4:
         i = int(st.number_input("행 번호(0부터)", min_value=0, max_value=len(d) - 1, value=0, step=1))
         base = d.loc[i, feats].astype(float)
         base_limit = float(d.loc[i, "기준강도"])
-        st.dataframe(d.loc[[i], feats + [target, "기준강도"]], use_container_width=True)
+        st.dataframe(d.loc[[i], feats + [target, "기준강도"]])
 
     base_df = pd.DataFrame([base.to_dict()])[feats]
     p0 = float(model.predict(base_df)[0])
@@ -331,7 +353,7 @@ with tab4:
     long = tor.melt(id_vars="속성", value_vars=["내렸을 때", "올렸을 때"], var_name="방향", value_name="강도 변화")
     fig = px.bar(long, x="강도 변화", y="속성", color="방향", orientation="h", barmode="relative")
     fig.update_layout(yaxis={"categoryorder": "array", "categoryarray": order})
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig)
     st.caption("막대가 길수록 그 속성이 조금만 변해도 예상 강도가 크게 흔들려요 (다른 속성은 출발점 값으로 고정).")
 
     # (B) 한 속성을 쭉 바꿔 보기
@@ -345,7 +367,7 @@ with tab4:
     fig.add_trace(go.Scatter(x=[float(base[sf])], y=[p0], mode="markers", name="출발점", marker=dict(size=14, symbol="star")))
     fig.add_hline(y=base_limit, line_dash="dash", line_color="#D62828", annotation_text="기준 강도")
     fig.update_layout(xaxis_title=sf, yaxis_title=target)
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig)
 
     ok = [g for g, p in zip(grid, preds) if p >= base_limit]
     if len(ok) == len(grid):
@@ -376,7 +398,7 @@ with tab4:
             row["범위 대비 이동(%)"] = abs(g - float(base[f])) / rng * 100
         need_rows.append(row)
     need_df = pd.DataFrame(need_rows).sort_values("범위 대비 이동(%)").round(2)
-    st.dataframe(need_df, use_container_width=True, hide_index=True)
+    st.dataframe(need_df, hide_index=True)
     st.caption("위쪽일수록 조금만 변해도 판정이 바뀌는 속성이에요. 값이 비어 있으면 그 속성 하나만으로는 판정이 바뀌지 않아요.")
 
     # (D) 전체 중요도
@@ -385,7 +407,7 @@ with tab4:
     with st.spinner("계산 중..."):
         pi = permutation_importance(model, X_te, s_te, n_repeats=5, random_state=42, scoring="r2")
     pdf = pd.DataFrame({"속성": feats, "R² 감소량": pi.importances_mean}).sort_values("R² 감소량")
-    st.plotly_chart(px.bar(pdf, x="R² 감소량", y="속성", orientation="h"), use_container_width=True)
+    st.plotly_chart(px.bar(pdf, x="R² 감소량", y="속성", orientation="h"))
     st.caption("속성 하나의 값을 무작위로 섞었을 때 모델 성능(R²)이 얼마나 떨어지는지예요. 많이 떨어질수록 중요한 속성이에요.")
 
 st.caption("학습용 분석이며, 실제 시설물의 안전 판단은 전문가의 시험과 평가가 필요해요.")
